@@ -27,6 +27,7 @@ public class ModernHookEntry extends XposedModule {
     public ModernHookEntry(@NonNull XposedInterface base, @NonNull XposedModuleInterface.ModuleLoadedParam param) {
         super(base, param);
         mModule = param;
+        Lsp100HookImpl.init(this);
     }
 
 

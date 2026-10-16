@@ -58,6 +58,10 @@ public class UnifiedEntryPoint {
         } catch (ReflectiveOperationException e) {
             Throwable cause = getInvocationTargetExceptionCause(e);
             android.util.Log.e(BuildConfig.TAG, "StartupAgent.startup: failed", cause);
+            try {
+                loaderService.log(cause);
+            } catch (Throwable ignored) {
+            }
             throw unsafeThrow(cause);
         }
     }

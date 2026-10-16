@@ -11,7 +11,10 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.HashMap;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
+import dalvik.system.BaseDexClassLoader;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
@@ -45,13 +48,13 @@ public class StartupHook {
      */
     public static void execStartupInit(@NonNull Context ctx, @Nullable Object step, String lpwReserved, boolean bReserved) {
         if (sSecondStageInit) {
-            throw new IllegalStateException("Second stage init already executed");
+            Log.w(BuildConfig.TAG, "Second stage init already executed, skipping");
+            return;
         }
         HybridClassLoader.setHostClassLoader(ctx.getClassLoader());
         StartupRoutine.execPostStartupInit(ctx, step, lpwReserved, bReserved);
         sSecondStageInit = true;
         deleteDirIfNecessaryNoThrow(ctx);
-
     }
 
     static void deleteDirIfNecessaryNoThrow(Context ctx) {
@@ -95,10 +98,14 @@ public class StartupHook {
         String msg = Log.getStackTraceString(th);
         Log.e(BuildConfig.TAG, msg);
         try {
-            StartupInfo.getLoaderService().log(th);
-        } catch (NoClassDefFoundError | NullPointerException e) {
-            Log.e("Xposed", msg);
-            Log.e("EdXposed-Bridge", msg);
+            if (StartupInfo.getLoaderService() != null) {
+                StartupInfo.getLoaderService().log(th);
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            XposedBridge.log(th);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -107,14 +114,118 @@ public class StartupHook {
         deleteDirIfNecessaryNoThrow(ctx);
     }
 
-    public void initializeBeforeAppCreate(@NonNull ClassLoader rtLoader) {
+    public void initializeBeforeAppCreate(@NonNull ClassLoader initialClassLoader) {
+        Log.i(BuildConfig.TAG, "StartupHook.initializeBeforeAppCreate: initialClassLoader=" + initialClassLoader);
         try {
-            XC_MethodHook startup = new XC_MethodHook(51) {
+            XposedBridge.log("[ono] StartupHook.initializeBeforeAppCreate: " + initialClassLoader);
+        } catch (Throwable ignored) {
+        }
+        // We need to be aware that Tinker may not have been applied yet.
+        // Hook com.tencent.common.app.QFixApplicationImplProxy#attachBaseContext(Context) to get the correct class loader.
+        final AtomicReference<ClassLoader> pSecondaryClassLoader = new AtomicReference<>();
+        final AtomicReference<Thread> pCallingThread = new AtomicReference<>();
+        try {
+            Class<?> kQFixApplicationImplProxy = initialClassLoader.loadClass("com.tencent.common.app.QFixApplicationImplProxy");
+            Method attachBaseContext = kQFixApplicationImplProxy.getDeclaredMethod("attachBaseContext", Context.class);
+            final AtomicReference<XC_MethodHook.Unhook> pUnhook1 = new AtomicReference<>();
+            final AtomicReference<Set<XC_MethodHook.Unhook>> pUnhooks = new AtomicReference<>();
+
+            pUnhook1.set(XposedBridge.hookMethod(attachBaseContext, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    Thread currentThread = Thread.currentThread();
+                    pCallingThread.set(currentThread);
+                }
+
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
+                    pCallingThread.set(null);
+                    Set<XC_MethodHook.Unhook> unhooks = pUnhooks.getAndSet(null);
+                    if (unhooks != null) {
+                        for (XC_MethodHook.Unhook unhook : unhooks) {
+                            unhook.unhook();
+                        }
+                    }
+                    ClassLoader cl = pSecondaryClassLoader.get();
+                    if (cl == null) {
+                        // No Tinker patch seems to be there. The initial class loader is the one we want.
+                        cl = initialClassLoader;
+                    }
+                    // unhook the method to avoid multiple calls
+                    XC_MethodHook.Unhook unhook = pUnhook1.getAndSet(null);
+                    if (unhook != null) {
+                        unhook.unhook();
+                    }
+                    Log.i(BuildConfig.TAG, "QFixApplicationImplProxy.attachBaseContext: resolved ClassLoader: " + cl);
+                    try {
+                        XposedBridge.log("[ono] QFixApplicationImplProxy.attachBaseContext: resolved ClassLoader: " + cl);
+                    } catch (Throwable ignored) {
+                    }
+                    initializeAfterTinkerApplied(cl);
+                }
+            }));
+            // hook BaseDexClassLoader constructor to get the class loader
+            pUnhooks.set(XposedBridge.hookAllConstructors(BaseDexClassLoader.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    ClassLoader cl = (ClassLoader) param.thisObject;
+                    Thread callingThread = pCallingThread.get();
+                    if (callingThread == null || callingThread != Thread.currentThread()) {
+                        // this is not the thread that called attachBaseContext, ignore
+                        return;
+                    }
+                    if (cl.toString().contains("moe.ono")) {
+                        Log.w(BuildConfig.TAG, "BaseDexClassLoader constructor called in ono, ignoring: " + cl, new Throwable());
+                        return;
+                    }
+                    if (!cl.toString().contains("com.tencent.") && !cl.toString().contains("TinkerClassLoader")) {
+                        return;
+                    }
+                    if (pSecondaryClassLoader.compareAndSet(null, cl)) {
+                        Log.i(BuildConfig.TAG, "Using BaseDexClassLoader.<init> for Tinker hot patch: " + cl);
+                        try {
+                            XposedBridge.log("[ono] Using BaseDexClassLoader.<init> for Tinker hot patch: " + cl);
+                        } catch (Throwable ignored) {
+                        }
+                        // we have found the class loader, unhook the method
+                        Set<XC_MethodHook.Unhook> unhooks = pUnhooks.getAndSet(null);
+                        if (unhooks != null) {
+                            for (XC_MethodHook.Unhook unhook : unhooks) {
+                                unhook.unhook();
+                            }
+                        }
+                    }
+                }
+            }));
+        } catch (ClassNotFoundException | NoSuchMethodException e) {
+            // maybe this is an old version of QQ or TIM, just ignore it
+            Log.w(BuildConfig.TAG, "QFixApplicationImplProxy not found, falling back to initialClassLoader: " + e.getMessage());
+            initializeAfterTinkerApplied(initialClassLoader);
+        }
+    }
+
+    public void initializeAfterTinkerApplied(@NonNull ClassLoader rtLoader) {
+        try {
+            XC_MethodHook startup = new XC_MethodHook(51) {
+                private boolean mExecuted = false;
+
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (mExecuted) {
+                        return;
+                    }
+                    mExecuted = true;
+                    Log.i(BuildConfig.TAG, "LoadDexTask.run afterHookedMethod triggered!");
+                    try {
+                        XposedBridge.log("[ono] LoadDexTask.run afterHookedMethod triggered!");
+                    } catch (Throwable ignored) {
+                    }
                     ClassLoader cl = param.thisObject.getClass().getClassLoader();
                     assert cl != null;
                     Context app = StartupAgent.getBaseApplicationImpl(cl);
+                    if (app == null && param.args != null && param.args.length > 0 && param.args[0] instanceof Context) {
+                        app = (Context) param.args[0];
+                    }
                     execStartupInit(app, param.thisObject, null, false);
                 }
             };
@@ -140,6 +251,11 @@ public class StartupHook {
                 throw new RuntimeException("neither LoadDexTask.run(Context) nor LoadDex.doStep() found");
             }
             Method m = run != null ? run : doStep;
+            Log.i(BuildConfig.TAG, "StartupHook: hooking " + m.getDeclaringClass().getName() + "." + m.getName());
+            try {
+                XposedBridge.log("[ono] StartupHook: hooking " + m.getDeclaringClass().getName() + "." + m.getName());
+            } catch (Throwable ignored) {
+            }
             XposedBridge.hookMethod(m, startup);
         } catch (Throwable e) {
             if (e.toString().contains("com.bug.zqq")) {
